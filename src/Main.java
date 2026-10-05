@@ -1,14 +1,28 @@
+import java.io.BufferedOutputStream;
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Main {
+
+    static final byte KEEP = 0;
+    static final byte INSERT = 1;
+    static final byte DELETE = 2;
+
+    // Buffered raw output. System.out flushes on every '\n' write, which is very slow.
+    static final OutputStream out =
+            new BufferedOutputStream(new FileOutputStream(FileDescriptor.out), 1 << 16);
 
     public static void main(String[] args) {
 
@@ -29,22 +43,24 @@ public class Main {
             List<byte[]> a = readLines(aPath);
             List<byte[]> b = readLines(bPath);
 
-            List<int[]> trace = myersLines(a, b);
+            // Map every distinct line to an int id so comparisons are O(1).
+            Map<ByteBuffer, Integer> ids = new HashMap<>();
+            int[] aIds = toIds(a, ids);
+            int[] bIds = toIds(b, ids);
+            ids = null;
 
-            List<Edit> edits = backtrack(
-                    a.size(),
-                    b.size(),
-                    trace,
-                    false
-            );
+            List<int[]> trace = myers(aIds, bIds, false);
+
+            Edits edits = backtrack(aIds.length, bIds.length, trace, false);
+            trace = null;
 
             if (command.equals("lines")) {
-                printLines(a, b, edits);
+                printEdits(a, b, edits, false);
             } else {
-                printHighlight(a, b, edits);
+                printEdits(a, b, edits, true);
             }
 
-            System.out.flush();
+            out.flush();
 
         } catch (IOException e) {
             System.err.println(
@@ -53,6 +69,10 @@ public class Main {
             System.exit(2);
         }
     }
+
+    // ============================================================
+    // INPUT
+    // ============================================================
 
     static List<byte[]> readLines(String path) throws IOException {
 
@@ -66,13 +86,7 @@ public class Main {
 
             if (data[i] == '\n') {
 
-                lines.add(
-                        Arrays.copyOfRange(
-                                data,
-                                start,
-                                i
-                        )
-                );
+                lines.add(Arrays.copyOfRange(data, start, i));
 
                 start = i + 1;
             }
@@ -80,28 +94,51 @@ public class Main {
 
         if (start < data.length) {
 
-            lines.add(
-                    Arrays.copyOfRange(
-                            data,
-                            start,
-                            data.length
-                    )
-            );
+            lines.add(Arrays.copyOfRange(data, start, data.length));
         }
 
         return lines;
     }
 
-    interface Equality {
-        boolean equal(int x, int y);
+    static int[] toIds(List<byte[]> lines, Map<ByteBuffer, Integer> ids) {
+
+        int[] result = new int[lines.size()];
+
+        for (int i = 0; i < result.length; i++) {
+
+            ByteBuffer key = ByteBuffer.wrap(lines.get(i));
+
+            Integer id = ids.get(key);
+
+            if (id == null) {
+                id = ids.size();
+                ids.put(key, id);
+            }
+
+            result[i] = id;
+        }
+
+        return result;
     }
 
+    // ============================================================
+    // MYERS
+    // ============================================================
+
+    /*
+     * Shortest edit script search.
+     *
+     * trace.get(d) stores only the furthest-x values of the diagonals that
+     * exist at step d: k = -d, -d+2, ..., d. Diagonal k is at index (k + d) / 2.
+     * That is d + 1 ints per step instead of the whole V array.
+     */
     static List<int[]> myers(
-            int n,
-            int m,
-            Equality equal,
+            int[] a,
+            int[] b,
             boolean preferInsertOnTie) {
 
+        int n = a.length;
+        int m = b.length;
         int max = n + m;
 
         List<int[]> trace = new ArrayList<>();
@@ -110,14 +147,13 @@ public class Main {
 
         int offset = max + 1;
 
-        Arrays.fill(
-                v,
-                Integer.MIN_VALUE / 4
-        );
+        Arrays.fill(v, Integer.MIN_VALUE / 4);
 
         v[offset + 1] = 0;
 
         for (int d = 0; d <= max; d++) {
+
+            int[] row = new int[d + 1];
 
             for (int k = -d; k <= d; k += 2) {
 
@@ -133,11 +169,8 @@ public class Main {
 
                 } else {
 
-                    int insertionX =
-                            v[k + 1 + offset];
-
-                    int deletionX =
-                            v[k - 1 + offset] + 1;
+                    int insertionX = v[k + 1 + offset];
+                    int deletionX = v[k - 1 + offset] + 1;
 
                     if (insertionX > deletionX) {
 
@@ -159,70 +192,67 @@ public class Main {
 
                 int y = x - k;
 
-                while (
-                        x < n
-                                && y < m
-                                && equal.equal(x, y)
-                ) {
+                while (x < n && y < m && a[x] == b[y]) {
 
                     x++;
                     y++;
                 }
 
                 v[k + offset] = x;
+                row[(k + d) >> 1] = x;
 
                 if (x >= n && y >= m) {
 
-                    // Save only diagonals -d..d (index of k is k + d).
-                    trace.add(Arrays.copyOfRange(v, offset - d, offset + d + 1));
+                    trace.add(row);
 
                     return trace;
                 }
             }
 
-            trace.add(Arrays.copyOfRange(v, offset - d, offset + d + 1));
+            trace.add(row);
         }
 
         return trace;
     }
 
-    static List<int[]> myersLines(
-            List<byte[]> a,
-            List<byte[]> b) {
+    // ============================================================
+    // BACKTRACK
+    // ============================================================
 
-        return myers(
-                a.size(),
-                b.size(),
-                (x, y) ->
-                        Arrays.equals(
-                                a.get(x),
-                                b.get(y)
-                        ),
-                false
-        );
+    /*
+     * Compact edit script: type[i] and idx[i] for i in [start, end).
+     * KEEP and DELETE: idx is the index in A.
+     * INSERT: idx is the index in B.
+     */
+    static class Edits {
+
+        byte[] type;
+        int[] idx;
+        int start;
+        int end;
     }
 
-    static List<Edit> backtrack(
+    static Edits backtrack(
             int n,
             int m,
             List<int[]> trace,
             boolean preferInsertOnTie) {
 
+        int cap = n + m;
+
+        Edits e = new Edits();
+        e.type = new byte[cap];
+        e.idx = new int[cap];
+        e.end = cap;
+
+        int pos = cap;
+
         int x = n;
         int y = m;
 
-        List<Edit> edits = new ArrayList<>();
-
-        for (
-                int d = trace.size() - 1;
-                d > 0;
-                d--
-        ) {
+        for (int d = trace.size() - 1; d > 0; d--) {
 
             int[] previousV = trace.get(d - 1);
-
-            // In previousV (saved at step d-1), diagonal k is at index k + (d - 1).
-            int base = d - 1;
 
             int k = x - y;
 
@@ -238,9 +268,9 @@ public class Main {
 
             } else {
 
-                int insertionX = previousV[k + 1 + base];
-
-                int deletionX = previousV[k - 1 + base] + 1;
+                // previousV is step d-1; diagonal j is at index (j + d - 1) / 2.
+                int insertionX = previousV[(k + d) >> 1];
+                int deletionX = previousV[(k + d - 2) >> 1] + 1;
 
                 if (insertionX > deletionX) {
 
@@ -260,22 +290,15 @@ public class Main {
                 }
             }
 
-            int previousX = previousV[previousK + base];
+            int previousX = previousV[(previousK + d - 1) >> 1];
 
             int previousY = previousX - previousK;
 
-            while (
-                    x > previousX
-                            && y > previousY
-            ) {
+            while (x > previousX && y > previousY) {
 
-                edits.add(
-                        new Edit(
-                                "KEEP",
-                                x - 1,
-                                y - 1
-                        )
-                );
+                pos--;
+                e.type[pos] = KEEP;
+                e.idx[pos] = x - 1;
 
                 x--;
                 y--;
@@ -283,25 +306,17 @@ public class Main {
 
             if (x == previousX) {
 
-                edits.add(
-                        new Edit(
-                                "INSERT",
-                                -1,
-                                y - 1
-                        )
-                );
+                pos--;
+                e.type[pos] = INSERT;
+                e.idx[pos] = y - 1;
 
                 y--;
 
             } else {
 
-                edits.add(
-                        new Edit(
-                                "DELETE",
-                                x - 1,
-                                -1
-                        )
-                );
+                pos--;
+                e.type[pos] = DELETE;
+                e.idx[pos] = x - 1;
 
                 x--;
             }
@@ -309,259 +324,157 @@ public class Main {
 
         while (x > 0 && y > 0) {
 
-            edits.add(
-                    new Edit(
-                            "KEEP",
-                            x - 1,
-                            y - 1
-                    )
-            );
+            pos--;
+            e.type[pos] = KEEP;
+            e.idx[pos] = x - 1;
 
             x--;
             y--;
         }
 
-        Collections.reverse(edits);
+        e.start = pos;
 
-        return edits;
+        return e;
     }
 
-    static void printLines(
+    // ============================================================
+    // PRINTING (Part A and Part B)
+    // ============================================================
+
+    static void printEdits(
             List<byte[]> a,
             List<byte[]> b,
-            List<Edit> edits)
+            Edits e,
+            boolean highlight)
             throws IOException {
 
-        int i = 0;
+        int i = e.start;
 
-        while (i < edits.size()) {
+        while (i < e.end) {
 
-            Edit edit = edits.get(i);
+            if (e.type[i] == KEEP) {
 
-            if (edit.type.equals("KEEP")) {
-
-                printLine(
-                        ' ',
-                        a.get(edit.aIndex)
-                );
+                printLine(' ', a.get(e.idx[i]));
 
                 i++;
                 continue;
             }
 
-            List<Edit> deletes = new ArrayList<>();
-            List<Edit> inserts = new ArrayList<>();
+            // One complete change block: [i, j)
+            int j = i;
 
-            while (
-                    i < edits.size()
-                            &&
-                    !edits.get(i)
-                            .type
-                            .equals("KEEP")
-            ) {
+            while (j < e.end && e.type[j] != KEEP) {
+                j++;
+            }
 
-                Edit current = edits.get(i);
+            int deleteCount = 0;
+            int insertCount = 0;
 
-                if (current.type.equals("DELETE")) {
+            for (int p = i; p < j; p++) {
 
-                    deletes.add(current);
-
+                if (e.type[p] == DELETE) {
+                    deleteCount++;
                 } else {
+                    insertCount++;
+                }
+            }
 
-                    inserts.add(current);
+            // Deletes first.
+            for (int p = i; p < j; p++) {
+
+                if (e.type[p] == DELETE) {
+                    printLine('-', a.get(e.idx[p]));
+                }
+            }
+
+            // Then inserts; in highlight mode, the p-th insert is paired
+            // with the p-th delete.
+            int pairs = Math.min(deleteCount, insertCount);
+
+            int deletePointer = i;
+            int insertNumber = 0;
+
+            for (int p = i; p < j; p++) {
+
+                if (e.type[p] != INSERT) {
+                    continue;
                 }
 
-                i++;
-            }
+                printLine('+', b.get(e.idx[p]));
 
-            for (Edit delete : deletes) {
+                if (highlight && insertNumber < pairs) {
 
-                printLine(
-                        '-',
-                        a.get(delete.aIndex)
-                );
-            }
-
-            for (Edit insert : inserts) {
-
-                printLine(
-                        '+',
-                        b.get(insert.bIndex)
-                );
-            }
-        }
-    }
-
-    static void printHighlight(
-            List<byte[]> a,
-            List<byte[]> b,
-            List<Edit> edits)
-            throws IOException {
-
-        int i = 0;
-
-        while (i < edits.size()) {
-
-            Edit edit = edits.get(i);
-
-            if (edit.type.equals("KEEP")) {
-
-                printLine(
-                        ' ',
-                        a.get(edit.aIndex)
-                );
-
-                i++;
-                continue;
-            }
-
-            List<Edit> deletes = new ArrayList<>();
-            List<Edit> inserts = new ArrayList<>();
-
-            while (
-                    i < edits.size()
-                            &&
-                    !edits.get(i)
-                            .type
-                            .equals("KEEP")
-            ) {
-
-                Edit current = edits.get(i);
-
-                if (current.type.equals("DELETE")) {
-
-                    deletes.add(current);
-
-                } else {
-
-                    inserts.add(current);
-                }
-
-                i++;
-            }
-
-            for (Edit delete : deletes) {
-
-                printLine(
-                        '-',
-                        a.get(delete.aIndex)
-                );
-            }
-
-            int pairs =
-                    Math.min(
-                            deletes.size(),
-                            inserts.size()
-                    );
-
-            for (
-                    int p = 0;
-                    p < inserts.size();
-                    p++
-            ) {
-
-                Edit insert = inserts.get(p);
-
-                printLine(
-                        '+',
-                        b.get(insert.bIndex)
-                );
-
-                if (p < pairs) {
-
-                    Edit delete =
-                            deletes.get(p);
+                    while (e.type[deletePointer] != DELETE) {
+                        deletePointer++;
+                    }
 
                     RangeResult result =
                             characterDiff(
-                                    a.get(delete.aIndex),
-                                    b.get(insert.bIndex)
+                                    a.get(e.idx[deletePointer]),
+                                    b.get(e.idx[p])
                             );
+
+                    deletePointer++;
 
                     printRanges(result);
                 }
+
+                insertNumber++;
             }
+
+            i = j;
         }
     }
+
+    // ============================================================
+    // CHARACTER DIFF
+    // ============================================================
 
     static RangeResult characterDiff(
             byte[] oldBytes,
             byte[] newBytes) {
 
-        String oldText =
-                new String(
-                        oldBytes,
-                        StandardCharsets.UTF_8
-                );
-
-        String newText =
-                new String(
-                        newBytes,
-                        StandardCharsets.UTF_8
-                );
-
         int[] oldCodePoints =
-                oldText
+                new String(oldBytes, StandardCharsets.UTF_8)
                         .codePoints()
                         .toArray();
 
         int[] newCodePoints =
-                newText
+                new String(newBytes, StandardCharsets.UTF_8)
                         .codePoints()
                         .toArray();
 
-        List<int[]> trace =
-                myers(
-                        oldCodePoints.length,
-                        newCodePoints.length,
-                        (x, y) ->
-                                oldCodePoints[x]
-                                        ==
-                                newCodePoints[y],
-                        false
-                );
+        List<int[]> trace = myers(oldCodePoints, newCodePoints, false);
 
-        List<Edit> edits =
-                backtrack(
-                        oldCodePoints.length,
-                        newCodePoints.length,
-                        trace,
-                        false
-                );
+        Edits e = backtrack(
+                oldCodePoints.length,
+                newCodePoints.length,
+                trace,
+                false
+        );
 
-        List<Range> oldRanges =
-                new ArrayList<>();
-
-        List<Range> newRanges =
-                new ArrayList<>();
+        List<Range> oldRanges = new ArrayList<>();
+        List<Range> newRanges = new ArrayList<>();
 
         int oldPos = 0;
         int newPos = 0;
 
-        for (Edit edit : edits) {
+        for (int i = e.start; i < e.end; i++) {
 
-            if (edit.type.equals("KEEP")) {
+            if (e.type[i] == KEEP) {
 
                 oldPos++;
                 newPos++;
 
-            } else if (
-                    edit.type.equals("DELETE")
-            ) {
+            } else if (e.type[i] == DELETE) {
 
-                addPosition(
-                        oldRanges,
-                        oldPos
-                );
+                oldRanges.add(new Range(oldPos, oldPos + 1));
 
                 oldPos++;
 
             } else {
 
-                addPosition(
-                        newRanges,
-                        newPos
-                );
+                newRanges.add(new Range(newPos, newPos + 1));
 
                 newPos++;
             }
@@ -573,54 +486,28 @@ public class Main {
         );
     }
 
-    static void addPosition(
-            List<Range> ranges,
-            int position) {
-
-        ranges.add(
-                new Range(
-                        position,
-                        position + 1
-                )
-        );
-    }
-
-    static List<Range> mergeRanges(
-            List<Range> ranges) {
+    static List<Range> mergeRanges(List<Range> ranges) {
 
         if (ranges.isEmpty()) {
             return ranges;
         }
 
-        ranges.sort(
-                Comparator.comparingInt(
-                        r -> r.start
-                )
-        );
+        ranges.sort(Comparator.comparingInt(r -> r.start));
 
-        List<Range> result =
-                new ArrayList<>();
+        List<Range> result = new ArrayList<>();
 
         Range current = ranges.get(0);
 
-        for (
-                int i = 1;
-                i < ranges.size();
-                i++
-        ) {
+        for (int i = 1; i < ranges.size(); i++) {
 
             Range next = ranges.get(i);
 
             if (next.start <= current.end) {
 
-                current =
-                        new Range(
-                                current.start,
-                                Math.max(
-                                        current.end,
-                                        next.end
-                                )
-                        );
+                current = new Range(
+                        current.start,
+                        Math.max(current.end, next.end)
+                );
 
             } else {
 
@@ -634,94 +521,65 @@ public class Main {
         return result;
     }
 
-    static void printRanges(
-            RangeResult result) {
+    // ============================================================
+    // OUTPUT
+    // ============================================================
 
-        System.out.print("? ");
+    static void printRanges(RangeResult result) throws IOException {
 
-        printRangeList(
-                result.oldRanges
-        );
+        StringBuilder sb = new StringBuilder();
 
-        System.out.print(" | ");
+        sb.append("? ");
 
-        printRangeList(
-                result.newRanges
-        );
+        appendRangeList(sb, result.oldRanges);
 
-        System.out.print("\n");
-        System.out.flush();
+        sb.append(" | ");
+
+        appendRangeList(sb, result.newRanges);
+
+        sb.append('\n');
+
+        out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
     }
 
-    static void printRangeList(
-            List<Range> ranges) {
+    static void appendRangeList(StringBuilder sb, List<Range> ranges) {
 
         if (ranges.isEmpty()) {
 
-            System.out.print(".");
+            sb.append('.');
             return;
         }
 
-        for (
-                int i = 0;
-                i < ranges.size();
-                i++
-        ) {
+        for (int i = 0; i < ranges.size(); i++) {
 
             if (i > 0) {
-                System.out.print(",");
+                sb.append(',');
             }
 
-            Range range =
-                    ranges.get(i);
+            Range range = ranges.get(i);
 
-            System.out.print(
-                    range.start
-                            + "-"
-                            + range.end
-            );
+            sb.append(range.start).append('-').append(range.end);
         }
     }
 
-    static void printLine(
-            char prefix,
-            byte[] line)
-            throws IOException {
+    static void printLine(char prefix, byte[] line) throws IOException {
 
-        System.out.write(
-                (byte) prefix
-        );
-
-        System.out.write(line);
-
-        System.out.write('\n');
+        // Write original bytes directly; preserves invalid UTF-8 and \r.
+        out.write((byte) prefix);
+        out.write(line);
+        out.write('\n');
     }
 
-    static class Edit {
-
-        String type;
-        int aIndex;
-        int bIndex;
-
-        Edit(
-                String type,
-                int aIndex,
-                int bIndex) {
-
-            this.type = type;
-            this.aIndex = aIndex;
-            this.bIndex = bIndex;
-        }
-    }
+    // ============================================================
+    // DATA CLASSES
+    // ============================================================
 
     static class Range {
 
         int start;
         int end;
 
-        Range(
-                int start,
-                int end) {
+        Range(int start, int end) {
 
             this.start = start;
             this.end = end;
@@ -733,9 +591,7 @@ public class Main {
         List<Range> oldRanges;
         List<Range> newRanges;
 
-        RangeResult(
-                List<Range> oldRanges,
-                List<Range> newRanges) {
+        RangeResult(List<Range> oldRanges, List<Range> newRanges) {
 
             this.oldRanges = oldRanges;
             this.newRanges = newRanges;
